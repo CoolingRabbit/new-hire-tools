@@ -1,10 +1,16 @@
 # 新员工入职工具箱 (New Hire Toolbox)
 
-为 corp1.local / corp2.local 双域环境设计的新员工入职支持工具，供 IT 与 Helpdesk 使用。
+为 corp1.local / corp2.local 多域环境设计的新员工入职支持工具，供 IT 与 Helpdesk 使用。
 单文件 exe，仅依赖 Windows 自带的 .NET Framework 4.x，双击即用，无需安装、无需配置。
 
 两个域中相同员工号的账号使用相同的初始密码——工具箱通过内置 Seed 与统一的
 HMAC-SHA256 算法保证各处计算结果一致且可复现。
+
+## AI构建提示词
+
+```
+请先阅读 https://github.com/CoolingRabbit/new-hire-tools 仓库，在和我确认好具体需求后，参考它为我创建一个适合我环境的新员工入职工具箱；过程中如有改进建议，请整理成文档，便于我提交 Issues。
+```
 
 ## 功能特性
 
@@ -33,28 +39,9 @@ HMAC-SHA256 算法保证各处计算结果一致且可复现。
 |---|---|---|
 | ![NAS懒人映射](assets/screenshots/tab1-nas-mapping.png) | ![初始密码查询](assets/screenshots/tab2-password-query.png) | ![自定义映射](assets/screenshots/tab3-custom-mapping.png) |
 
-界面采用 Win11 原生风格融合 macOS 审美：自绘沉浸式标题栏与圆角窗口、
+界面采用 Win11 原生风格：自绘沉浸式标题栏与圆角窗口、
 设计 token 化的配色/字阶/间距（8px 网格）、柔和投影、分段式导航胶囊滑动动画、
 按钮渐变过渡、输入框聚焦高亮等微交互。
-
-## 快速开始
-
-下载或编译得到 `dist/NewHireToolbox.exe`，双击运行即可：
-
-- IT 新建 AD 账户：使用 **初始密码查询** 页生成密码并复制
-- Helpdesk 配置新员工电脑（无需加域）：使用 **NAS懒人映射** 页，输入员工号一键完成
-- 临时映射其他服务器：使用 **自定义映射** 页
-
-## 从源码构建
-
-双击 `build.bat`，或使用命令行：
-
-```bat
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe ^
-    -target:winexe -utf8output -codepage:65001 -nologo ^
-    -reference:System.dll,System.Drawing.dll,System.Windows.Forms.dll,System.Management.dll ^
-    -out:dist\NewHireToolbox.exe src\NewHireToolbox.cs src\PasswordGenerator.cs
-```
 
 ## 项目结构
 
