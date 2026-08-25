@@ -6,6 +6,19 @@
 两个域中相同员工号的账号使用相同的初始密码——工具箱通过内置 Seed 与统一的
 HMAC-SHA256 算法保证各处计算结果一致且可复现。
 
+## 使用须知（重要）
+
+本仓库为**脱敏公开版本**，克隆后请按以下步骤适配你自己的环境：
+
+1. **替换 Seed**：`src/PasswordGenerator.cs` 中的 `REPLACE-WITH-YOUR-OWN-SECRET-SEED`
+   是占位符，请换成你自己的高强度随机字符串并妥善保密——Seed 决定全部初始密码，
+   一经确定不要再改（改动会导致与已建账号的密码对不上）。
+2. **替换域名与 IP**：源码与文档中的 `corp1.local` / `corp2.local`、
+   `CORP1` / `corp2`、`192.168.100.10` / `192.168.200.22` 均为虚假占位值，
+   请改为你的真实域与 NAS 地址（主要在 `src/NewHireToolbox.cs` 的 `NasTargets` 数组）。
+3. **自行编译**：仓库不含编译产物（exe 会内嵌 Seed，故不入库），
+   完成上述替换后双击 `build.bat` 即可生成 `dist/NewHireToolbox.exe`。
+
 ## AI构建提示词
 
 ```
