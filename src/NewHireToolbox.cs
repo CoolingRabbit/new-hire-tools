@@ -1263,6 +1263,13 @@ namespace NewHireTools
             return code == 0;
         }
 
+        /// <summary>删除指定服务器的已存凭据。</summary>
+        public static bool DeleteCredential(string server, out string detail)
+        {
+            int code = Run("cmdkey", "/delete:" + server, out detail);
+            return code == 0;
+        }
+
         /// <summary>
         /// 用 netapi32 官方 API NetShareEnum 枚举服务器共享（net view 的内部实现同款，
         /// 但不走文本解析，天然支持含空格的共享名，也不受 net view 客户端故障影响）。
@@ -1327,46 +1334,65 @@ namespace NewHireTools
             }
         }
 
-        /// <summary>探测结果：连接状态、凭据保存状态、共享列表、错误详情。</summary>
+        /// <summary>探测结果：连接状态、是否复用了本机已有凭据、共享列表、错误详情。</summary>
         public class ProbeResult
         {
             public bool Connected;
-            public bool CredentialSaved;
+            public bool UsedExistingCredential;
             public List<string> Shares = new List<string>();
             public string ErrorDetail = "";
         }
 
         /// <summary>
-        /// 标准探测流程（各功能页共用），顺序与经过现场多次检验的 map-nas.ps1 一致：
-        /// 先存凭据 -> 清理旧连接 -> NetShareEnum 验证并枚举共享。
-        /// 注意：目标 NAS 是 Samba 设备，不暴露可用的 IPC$ 命名共享
-        /// （net use \\IP\IPC$ 恒返回系统错误 67），绝不能用连接 IPC$ 的方式做探测。
-        /// 失败时回滚刚保存的凭据，避免留下错误凭据。
+        /// 探测流程（各功能页共用）。原则：探测不写凭据管理器，
+        /// 凭据只在用户确认映射时才写入。
+        /// 1. 优先用本机已有会话/凭据枚举（已有访问权限时零副作用）；
+        /// 2. 失败则用输入凭据建立临时会话（net use IPC$，不落盘）枚举后拆除；
+        /// 3. Samba NAS 拒绝显式 IPC$（错误 67）时回退为 cmdkey 方案
+        ///    （此时无旧凭据可覆盖；枚举失败则回滚删除刚存的凭据）。
+        /// 注意：绝不能用"net use \\IP\IPC$"的成功与否作为探测判据——
+        /// 目标 NAS 上该命令恒返回系统错误 67。
         /// </summary>
         public static ProbeResult ProbeServer(string server, string userName, string password)
         {
             ProbeResult result = new ProbeResult();
+            bool ok;
+            string err;
             string tmp;
 
-            result.CredentialSaved = SaveCredential(server, userName, password);
-            if (!result.CredentialSaved)
+            // 1. 本机已有访问权限时直接枚举（零副作用）
+            result.Shares = GetShares(server, out ok, out err);
+            if (ok)
+            {
+                result.Connected = true;
+                result.UsedExistingCredential = true;
+                return result;
+            }
+
+            // 2. 用输入凭据建立临时会话（不落盘），枚举后拆除
+            Run("net", "use \"\\\\" + server + "\\IPC$\" /delete /y", out tmp);
+            int code = Run("net", "use \"\\\\" + server + "\\IPC$\" /user:\"" + userName + "\" \"" + password + "\"", out tmp);
+            if (code == 0)
+            {
+                result.Shares = GetShares(server, out ok, out err);
+                Run("net", "use \"\\\\" + server + "\\IPC$\" /delete /y", out tmp);
+                if (ok) { result.Connected = true; return result; }
+                result.ErrorDetail = err;
+                return result;
+            }
+
+            // 3. NAS 拒绝显式 IPC$（Samba 常见，错误 67）：cmdkey 兜底
+            if (!SaveCredential(server, userName, password))
             {
                 result.ErrorDetail = "凭据保存失败，请检查当前用户权限";
                 return result;
             }
-
-            // 清理到该服务器的旧连接，避免多凭据冲突（1219 错误）
             Run("net", "use \"\\\\" + server + "\" /delete /y", out tmp);
-
-            bool viewOk;
-            string errorText;
-            result.Shares = GetShares(server, out viewOk, out errorText);
-            if (!viewOk)
+            result.Shares = GetShares(server, out ok, out err);
+            if (!ok)
             {
-                // 凭据无效或服务器不可达：回滚刚保存的凭据
-                Run("cmdkey", "/delete:" + server, out tmp);
-                result.CredentialSaved = false;
-                result.ErrorDetail = errorText;
+                Run("cmdkey", "/delete:" + server, out tmp);   // 回滚错误凭据
+                result.ErrorDetail = err;
                 return result;
             }
 
@@ -2007,20 +2033,48 @@ namespace NewHireTools
         // ====================================================================
 
         /// <summary>
-        /// 映射流程（Tab1 / Tab3 共用）：按 uncList 顺序从 Z: 向下分配盘符
-        /// （自动跳过已占用），逐个映射并写日志，完成后执行 onComplete（UI 线程）。
+        /// 映射流程（Tab1 / Tab3 共用）：探测阶段不写凭据管理器，
+        /// 凭据只在用户确认映射时才写入（credsByServer：服务器 → [用户名, 密码]）。
+        /// 按 uncList 顺序从 Z: 向下分配盘符（自动跳过已占用），逐个映射并写日志；
+        /// 某服务器映射全部失败时回滚刚保存的凭据。完成后执行 onComplete（UI 线程）。
         /// </summary>
-        private void MapSharesAsync(List<string> uncList, TextBox log, Action onComplete)
+        private void MapSharesAsync(List<string> uncList, Dictionary<string, string[]> credsByServer, TextBox log, Action onComplete)
         {
             Task.Factory.StartNew(delegate
             {
+                // 1. 写入凭据 + 清理旧会话（让新凭据生效）
+                HashSet<string> servers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string unc in uncList)
+                    servers.Add(unc.Substring(2).Split('\\')[0]);
+
+                foreach (string server in servers)
+                {
+                    string[] cred = credsByServer[server];
+                    bool saved = NasOperations.SaveCredential(server, cred[0], cred[1]);
+                    string tmp;
+                    NasOperations.DeleteMapping("\\\\" + server, out tmp);   // 清理旧会话
+                    string s1 = server; bool sv1 = saved;
+                    this.BeginInvoke(new Action(delegate
+                    {
+                        Log(log, "已保存 " + s1 + " 的凭据" + (sv1 ? "" : "（保存失败，请检查权限）") + "，开始映射...");
+                    }));
+                }
+
+                // 2. 逐个映射
                 HashSet<string> used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (string id in NasOperations.GetMappedDrives().Keys)
                     if (id.Length > 0) used.Add(id.Substring(0, 1).ToUpper());
 
+                Dictionary<string, int> serverOk = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                Dictionary<string, int> serverTotal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
                 int ok = 0, fail = 0;
                 foreach (string unc in uncList)
                 {
+                    string server = unc.Substring(2).Split('\\')[0];
+                    if (!serverOk.ContainsKey(server)) { serverOk[server] = 0; serverTotal[server] = 0; }
+                    serverTotal[server]++;
+
                     string letter = NasOperations.NextFreeLetter(used);
                     if (letter == null)
                     {
@@ -2031,12 +2085,28 @@ namespace NewHireTools
                     }
                     string detail;
                     bool success = NasOperations.MapShare(letter, unc, out detail);
-                    if (success) ok++; else fail++;
+                    if (success) { ok++; serverOk[server]++; } else fail++;
                     string msg = success
                         ? letter + ":  ->  " + unc + "   映射成功"
                         : unc + "   映射失败（" + detail + "）";
                     this.BeginInvoke(new Action(delegate { Log(log, msg); }));
                 }
+
+                // 3. 某服务器全部失败：回滚凭据（典型为凭据错误）
+                foreach (string server in servers)
+                {
+                    if (serverTotal[server] > 0 && serverOk[server] == 0)
+                    {
+                        string tmp;
+                        NasOperations.DeleteCredential(server, out tmp);
+                        string s2 = server;
+                        this.BeginInvoke(new Action(delegate
+                        {
+                            Log(log, s2 + " 映射全部失败，已删除刚保存的凭据（请检查用户名和密码）");
+                        }));
+                    }
+                }
+
                 int okF = ok, failF = fail;
                 this.BeginInvoke(new Action(delegate
                 {
@@ -2111,7 +2181,8 @@ namespace NewHireTools
                     {
                         this.BeginInvoke(new Action(delegate
                         {
-                            Log(_log1, nas.Tag + "（" + nas.Ip + "）连接成功" + (pr.CredentialSaved ? "，凭据已保存" : "，凭据保存失败"));
+                            Log(_log1, nas.Tag + "（" + nas.Ip + "）连接成功"
+                                + (pr.UsedExistingCredential ? "（使用本机已有凭据）" : ""));
                         }));
                         if (pr.Shares.Count == 0)
                         {
@@ -2167,11 +2238,25 @@ namespace NewHireTools
             List<string> selected = _lstShares.GetSelectedUncs();
             if (selected.Count == 0) { Log(_log1, "请先勾选需要映射的共享"); return; }
 
+            // 凭据只在用户确认映射时才写入凭据管理器（探测阶段不写）
+            string empId = _txtEmpId.Text.Trim();
+            string password = PasswordGenerator.Generate(empId);
+            Dictionary<string, string[]> creds = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            foreach (string unc in selected)
+            {
+                string server = unc.Substring(2).Split('\\')[0];
+                if (creds.ContainsKey(server)) continue;
+                string domain = "CORP1";
+                foreach (NasTarget nas in NasTargets)
+                    if (nas.Ip == server) { domain = nas.Domain; break; }
+                creds[server] = new string[] { domain + "\\" + empId, password };
+            }
+
             _btnMap.Enabled = false;
             _btnProbe.Enabled = false;
             _ring1.Running = true;
             Log(_log1, "开始映射（按列表顺序从 Z: 依次分配盘符）...");
-            MapSharesAsync(selected, _log1, delegate
+            MapSharesAsync(selected, creds, _log1, delegate
             {
                 _btnMap.Enabled = true;
                 _btnProbe.Enabled = true;
@@ -2252,7 +2337,8 @@ namespace NewHireTools
                     }
                     else
                     {
-                        Log(_log3, "连接成功" + (pr.CredentialSaved ? "，凭据已保存" : "，凭据保存失败"));
+                        Log(_log3, "连接成功" + (pr.UsedExistingCredential
+                            ? "（使用本机已有凭据；输入的凭据将在映射时验证）" : ""));
                         if (pr.Shares.Count == 0)
                         {
                             Log(_log3, "该服务器上没有查询到可用共享");
@@ -2285,11 +2371,16 @@ namespace NewHireTools
             List<string> selected = _lstCustomShares.GetSelectedUncs();
             if (selected.Count == 0) { Log(_log3, "请先探测共享并勾选需要映射的项"); return; }
 
+            // 凭据只在用户确认映射时才写入凭据管理器（探测阶段不写）
+            string server = selected[0].Substring(2).Split('\\')[0];
+            Dictionary<string, string[]> creds = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            creds[server] = new string[] { _txtUser.Text.Trim(), _txtPass.Text };
+
             _btnCustomMap.Enabled = false;
             _btnCustomProbe.Enabled = false;
             _ring3.Running = true;
             Log(_log3, "开始映射（按列表顺序从 Z: 依次分配盘符）...");
-            MapSharesAsync(selected, _log3, delegate
+            MapSharesAsync(selected, creds, _log3, delegate
             {
                 _btnCustomMap.Enabled = true;
                 _btnCustomProbe.Enabled = true;
