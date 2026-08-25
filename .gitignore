@@ -1,0 +1,22 @@
+# 编译中间产物
+bin/
+obj/
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# 测试输出截图
+tests/shot-*.png
+
+# 系统文件
+Thumbs.db
+desktop.ini
+
+# 编译产物与本地归档（不入库）
+dist/
+beta.zip
+tests/*.exe
+tests/*.png
